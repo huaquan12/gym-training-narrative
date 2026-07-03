@@ -1,16 +1,10 @@
 /**
- * 阿里云 FC 媒体处理服务
+ * 阿里云 FC 媒体处理服务 (Node.js 20 runtime - Event handler)
  * 
- * 功能：
- * 1. POST /sign-upload   — 生成 OSS 上传签名 URL
- * 2. POST /sign-download  — 生成 OSS 下载签名 URL（支持缩略图）
- * 3. POST /process-media  — 触发媒体后处理（缩略图、OCR placeholder）
- * 
- * 环境变量：
- *   OSS_ACCESS_KEY_ID, OSS_ACCESS_KEY_SECRET
- *   OSS_BUCKET=pubhtml-files
- *   OSS_REGION=oss-cn-hangzhou
- *   ALLOWED_ORIGINS=https://pub.cuige.xin,https://gym.cuige.xin
+ * Routes:
+ *   POST /sign-upload   — 生成 OSS 上传签名 URL
+ *   POST /sign-download  — 生成 OSS 下载签名 URL
+ *   POST /batch-sign     — 批量签名
  */
 
 import crypto from 'crypto';
@@ -19,140 +13,52 @@ const BUCKET = process.env.OSS_BUCKET || 'pubhtml-files';
 const REGION = process.env.OSS_REGION || 'oss-cn-hangzhou';
 const AK_ID = process.env.OSS_ACCESS_KEY_ID;
 const AK_SECRET = process.env.OSS_ACCESS_KEY_SECRET;
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',');
 
-// --- OSS 签名工具 ---
+// --- OSS V1 签名 (兼容性更好) ---
 
-function hmacSha256(key, data) {
-  return crypto.createHmac('sha256', key).update(data).digest();
-}
-
-function getSignatureKey(secret, dateStamp, region, service) {
-  const kDate = hmacSha256(`aliyun_v4${secret}`, dateStamp);
-  const kRegion = hmacSha256(kDate, region);
-  const kService = hmacSha256(kRegion, service);
-  const kSigning = hmacSha256(kService, 'aliyun_v4_request');
-  return kSigning;
-}
-
-/**
- * 生成 OSS V4 签名的预签名 PUT URL
- */
-function generatePresignedPutUrl(objectKey, contentType, expiresSeconds = 900) {
-  const now = new Date();
-  const dateStamp = now.toISOString().replace(/[-:]/g, '').slice(0, 8);
-  const amzDate = now.toISOString().replace(/[-:]/g, '').slice(0, 15) + 'Z';
-  const regionId = REGION.replace('oss-', '');
-  
+function generatePresignedUrl(method, objectKey, expiresSeconds = 900) {
   const host = `${BUCKET}.${REGION}.aliyuncs.com`;
+  const expires = Math.floor(Date.now() / 1000) + expiresSeconds;
   const encodedKey = objectKey.split('/').map(encodeURIComponent).join('/');
   
-  const credential = `${AK_ID}/${dateStamp}/${regionId}/oss/aliyun_v4_request`;
+  const stringToSign = `${method}\n\n\n${expires}\n/${BUCKET}/${objectKey}`;
+  const signature = crypto.createHmac('sha1', AK_SECRET).update(stringToSign).digest('base64');
   
-  const queryParams = new URLSearchParams({
-    'x-oss-signature-version': 'OSS4-HMAC-SHA256',
-    'x-oss-credential': credential,
-    'x-oss-date': amzDate,
-    'x-oss-expires': String(expiresSeconds),
-    'x-oss-additional-headers': '',
+  const params = new URLSearchParams({
+    OSSAccessKeyId: AK_ID,
+    Expires: String(expires),
+    Signature: signature
   });
-  queryParams.sort();
   
-  const canonicalRequest = [
-    'PUT',
-    `/${encodedKey}`,
-    queryParams.toString(),
-    `host:${host}`,
-    '',
-    'host',
-    'UNSIGNED-PAYLOAD'
-  ].join('\n');
-  
-  const hashedRequest = crypto.createHash('sha256').update(canonicalRequest).digest('hex');
-  const scope = `${dateStamp}/${regionId}/oss/aliyun_v4_request`;
-  const stringToSign = `OSS4-HMAC-SHA256\n${amzDate}\n${scope}\n${hashedRequest}`;
-  
-  const signingKey = getSignatureKey(AK_SECRET, dateStamp, regionId, 'oss');
-  const signature = hmacSha256(signingKey, stringToSign).toString('hex');
-  
-  queryParams.set('x-oss-signature', signature);
-  
-  return `https://${host}/${encodedKey}?${queryParams.toString()}`;
-}
-
-/**
- * 生成 OSS 签名的 GET URL
- */
-function generatePresignedGetUrl(objectKey, expiresSeconds = 3600) {
-  const now = new Date();
-  const dateStamp = now.toISOString().replace(/[-:]/g, '').slice(0, 8);
-  const amzDate = now.toISOString().replace(/[-:]/g, '').slice(0, 15) + 'Z';
-  const regionId = REGION.replace('oss-', '');
-  
-  const host = `${BUCKET}.${REGION}.aliyuncs.com`;
-  const encodedKey = objectKey.split('/').map(encodeURIComponent).join('/');
-  
-  const credential = `${AK_ID}/${dateStamp}/${regionId}/oss/aliyun_v4_request`;
-  
-  const queryParams = new URLSearchParams({
-    'x-oss-signature-version': 'OSS4-HMAC-SHA256',
-    'x-oss-credential': credential,
-    'x-oss-date': amzDate,
-    'x-oss-expires': String(expiresSeconds),
-    'x-oss-additional-headers': '',
-  });
-  queryParams.sort();
-  
-  const canonicalRequest = [
-    'GET',
-    `/${encodedKey}`,
-    queryParams.toString(),
-    `host:${host}`,
-    '',
-    'host',
-    'UNSIGNED-PAYLOAD'
-  ].join('\n');
-  
-  const hashedRequest = crypto.createHash('sha256').update(canonicalRequest).digest('hex');
-  const scope = `${dateStamp}/${regionId}/oss/aliyun_v4_request`;
-  const stringToSign = `OSS4-HMAC-SHA256\n${amzDate}\n${scope}\n${hashedRequest}`;
-  
-  const signingKey = getSignatureKey(AK_SECRET, dateStamp, regionId, 'oss');
-  const signature = hmacSha256(signingKey, stringToSign).toString('hex');
-  
-  queryParams.set('x-oss-signature', signature);
-  
-  return `https://${host}/${encodedKey}?${queryParams.toString()}`;
+  return `https://${host}/${encodedKey}?${params.toString()}`;
 }
 
 // --- CORS ---
-
 function corsHeaders(origin) {
-  const allowed = ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin);
   return {
-    'Access-Control-Allow-Origin': allowed ? (origin || '*') : '',
+    'Access-Control-Allow-Origin': origin || '*',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
   };
 }
 
-function jsonResponse(statusCode, body, origin) {
-  return {
-    statusCode,
-    headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
-    body: JSON.stringify(body),
-  };
-}
-
-// --- Handler ---
-
+// --- Handler (FC Event format) ---
 export async function handler(event, context) {
-  const req = JSON.parse(event.toString());
-  const method = req.httpMethod || req.method || 'POST';
-  const path = req.path || req.requestURI || '/';
-  const origin = (req.headers || {})['origin'] || (req.headers || {})['Origin'] || '';
-  
+  let req;
+  try {
+    req = typeof event === 'string' ? JSON.parse(event) : 
+          event instanceof Buffer ? JSON.parse(event.toString()) : event;
+  } catch {
+    req = {};
+  }
+
+  const method = req.httpMethod || req.method || req.requestContext?.http?.method || 'POST';
+  // FC HTTP trigger puts path in multiple possible locations
+  const path = req.rawPath || req.path || req.requestURI || 
+               req.requestContext?.http?.path || req.headers?.['x-fc-request-url'] || '/';
+  const origin = (req.headers || {})['origin'] || (req.headers || {})['Origin'] || '*';
+
   // CORS preflight
   if (method === 'OPTIONS') {
     return { statusCode: 204, headers: corsHeaders(origin), body: '' };
@@ -160,62 +66,73 @@ export async function handler(event, context) {
 
   let body;
   try {
-    body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+    const rawBody = req.body || '{}';
+    // FC may base64 encode the body
+    if (req.isBase64Encoded && typeof rawBody === 'string') {
+      body = JSON.parse(Buffer.from(rawBody, 'base64').toString());
+    } else {
+      body = typeof rawBody === 'string' ? JSON.parse(rawBody) : rawBody;
+    }
   } catch {
-    return jsonResponse(400, { error: 'Invalid JSON body' }, origin);
+    body = {};
   }
 
-  // --- POST /sign-upload ---
-  if (path.endsWith('/sign-upload')) {
-    const { fileName, contentType, sessionId, mediaType, exerciseName } = body;
+  const respond = (code, data) => ({
+    statusCode: code,
+    headers: { 'Content-Type': 'application/json', ...corsHeaders(origin) },
+    body: JSON.stringify(data),
+  });
+
+  // --- Route: POST /sign-upload ---
+  if (path.includes('sign-upload')) {
+    const { fileName, contentType, sessionId, mediaType } = body;
     if (!fileName || !contentType) {
-      return jsonResponse(400, { error: 'fileName and contentType required' }, origin);
+      return respond(400, { error: 'fileName and contentType required' });
     }
     
-    // 构建 OSS 路径: gym-media/{sessionId}/{mediaType}/{timestamp}_{fileName}
     const ts = Date.now();
     const safeFileName = fileName.replace(/[^a-zA-Z0-9._\-\u4e00-\u9fff]/g, '_');
     const prefix = sessionId ? `gym-media/${sessionId}` : 'gym-media/unsorted';
     const subDir = mediaType || 'misc';
     const objectKey = `${prefix}/${subDir}/${ts}_${safeFileName}`;
     
-    const uploadUrl = generatePresignedPutUrl(objectKey, contentType);
+    const uploadUrl = generatePresignedUrl('PUT', objectKey, 900);
     const accessUrl = `https://${BUCKET}.${REGION}.aliyuncs.com/${objectKey}`;
     
-    return jsonResponse(200, {
-      uploadUrl,
-      objectKey,
-      accessUrl,
-      expiresIn: 900,
-      meta: { sessionId, mediaType, exerciseName, fileName: safeFileName }
-    }, origin);
+    return respond(200, { uploadUrl, objectKey, accessUrl, expiresIn: 900 });
   }
 
-  // --- POST /sign-download ---
-  if (path.endsWith('/sign-download')) {
+  // --- Route: POST /sign-download ---
+  if (path.includes('sign-download')) {
     const { objectKey, expiresIn } = body;
-    if (!objectKey) {
-      return jsonResponse(400, { error: 'objectKey required' }, origin);
-    }
+    if (!objectKey) return respond(400, { error: 'objectKey required' });
     
-    const downloadUrl = generatePresignedGetUrl(objectKey, expiresIn || 3600);
-    return jsonResponse(200, { downloadUrl, expiresIn: expiresIn || 3600 }, origin);
+    const downloadUrl = generatePresignedUrl('GET', objectKey, expiresIn || 3600);
+    return respond(200, { downloadUrl, expiresIn: expiresIn || 3600 });
   }
 
-  // --- POST /batch-sign ---
-  if (path.endsWith('/batch-sign')) {
+  // --- Route: POST /batch-sign ---
+  if (path.includes('batch-sign')) {
     const { keys, expiresIn } = body;
     if (!Array.isArray(keys) || keys.length === 0) {
-      return jsonResponse(400, { error: 'keys array required' }, origin);
+      return respond(400, { error: 'keys array required' });
     }
-    
     const urls = keys.map(key => ({
       objectKey: key,
-      url: generatePresignedGetUrl(key, expiresIn || 3600)
+      url: generatePresignedUrl('GET', key, expiresIn || 3600)
     }));
-    
-    return jsonResponse(200, { urls }, origin);
+    return respond(200, { urls });
   }
 
-  return jsonResponse(404, { error: `Unknown path: ${path}` }, origin);
+  // --- Route: GET / (health check) ---
+  if (method === 'GET' || path === '/' || path === '') {
+    return respond(200, { 
+      status: 'ok', 
+      service: 'gym-media-service',
+      routes: ['/sign-upload', '/sign-download', '/batch-sign'],
+      debug: { path, method, hasBody: !!req.body }
+    });
+  }
+
+  return respond(404, { error: `Unknown path: ${path}`, debug: { rawPath: req.rawPath, path: req.path, uri: req.requestURI } });
 }

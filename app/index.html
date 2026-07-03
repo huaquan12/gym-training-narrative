@@ -313,7 +313,7 @@ const CONFIG = {
   KV_BASE: 'https://api.cuige.xin/v1/store/gym-session',
   KV_KEY: 'gym_data',
   STORE_TOKEN: '__STORE_TOKEN__',
-  FC_BASE: '', // Will be set after FC deployment
+  FC_BASE: 'https://gym-med-service-wetefapcun.cn-shanghai.fcapp.run',
   OSS_BUCKET: 'pubhtml-files',
   OSS_REGION: 'oss-cn-hangzhou',
 };
@@ -928,7 +928,12 @@ async function assembleSession() {
   storylines.forEach(sl => {
     const keyExercises = sl.key_exercises || [];
     const matchedExercises = assembledExercises.filter(ex => 
-      keyExercises.some(ke => ex.name.includes(ke) || ke.includes(ex.name))
+      keyExercises.some(ke => {
+        const a = ex.name.replace(/[\s\-]/g, '');
+        const b = ke.replace(/[\s\-]/g, '');
+        return a.includes(b) || b.includes(a) || 
+          a.split('').filter(c => b.includes(c)).length >= Math.min(a.length, b.length) * 0.6;
+      })
     );
     
     if (matchedExercises.length > 0) {
@@ -1289,37 +1294,58 @@ function parseTrainingText(text) {
   const exercises = [];
   const decisions = [];
   
-  // Pattern: 动作名 + 重量×次数×组数
-  // Examples: "深蹲85×10三组", "引体做了5个", "腿举120×12四组"
-  const exercisePattern = /([^\d\s,，。！？]+?)\s*(\d+(?:\.\d+)?)\s*[×xX*]\s*(\d+)\s*[×xX*]?\s*(\d+)?[组套]?/g;
-  let match;
-  while ((match = exercisePattern.exec(text)) !== null) {
-    const name = match[1].replace(/做了|完成了|练了/g, '').trim();
-    if (name.length > 0 && name.length < 10) {
-      exercises.push({
-        name,
-        weight: parseFloat(match[2]),
-        reps: parseInt(match[3]),
-        sets: match[4] ? parseInt(match[4]) : 3,
-        notes: ''
-      });
-    }
-  }
+  // Split by Chinese commas/periods/semicolons into segments, then parse each
+  const segments = text.split(/[,，;；。！!]+/).map(s => s.trim()).filter(Boolean);
   
-  // Simple pattern: "动作 重量 次数 组"
-  const simplePattern = /([^\d\s,，。]+?)\s+(\d+(?:\.\d+)?)\s*(?:kg|公斤)?\s+(\d+)\s*(?:次|个|rep)?\s+(\d+)\s*(?:组|set)/gi;
-  while ((match = simplePattern.exec(text)) !== null) {
-    const name = match[1].trim();
-    if (name.length > 0 && name.length < 10 && !exercises.find(e => e.name === name)) {
-      exercises.push({
-        name,
-        weight: parseFloat(match[2]),
-        reps: parseInt(match[3]),
-        sets: parseInt(match[4]),
-        notes: ''
-      });
+  segments.forEach(seg => {
+    // Pattern 1: 动作名-重量kg×次数×组数  or  动作名 重量×次数 三组
+    // Examples: "引体向上辅助-25kg×8三组完成", "高位下拉50×12三组", "深蹲85×10四组"
+    // Name can contain Chinese chars, letters, hyphens, spaces up to first digit or separator
+    const p1 = seg.match(/^(.+?)[\s\-]*?(\d+(?:\.\d+)?)\s*(?:kg|公斤)?\s*[×xX*]\s*(\d+)\s*(?:[×xX*]\s*(\d+))?\s*(?:[两三四五六七八九十百]?[组套])?/);
+    if (p1) {
+      const rawName = p1[1].replace(/做了|完成了|练了|今天|然后|接着|最后/g, '').trim();
+      if (rawName.length >= 1 && rawName.length <= 15) {
+        const setsFromChinese = seg.match(/([两三四五六七八九十])组/);
+        const chineseNum = {'两':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10};
+        const sets = p1[4] ? parseInt(p1[4]) : setsFromChinese ? (chineseNum[setsFromChinese[1]] || 3) : 3;
+        exercises.push({ name: rawName, weight: parseFloat(p1[2]), reps: parseInt(p1[3]), sets, notes: '' });
+        return;
+      }
     }
-  }
+    
+    // Pattern 2: 动作名 + 描述性参数 (如 "离心引体5秒控制×4两组")
+    // Handles tempo/time-based exercises: name + duration/description + ×count + 组
+    const p2 = seg.match(/^(.+?)(\d+)\s*(?:秒|s)\s*(?:控制|保持|停顿)?\s*[×xX*]\s*(\d+)\s*(?:[两三四五六七八九十]?[组套])?/);
+    if (p2) {
+      const rawName = p2[1].replace(/做了|完成了|练了|今天|然后|接着|最后/g, '').trim();
+      if (rawName.length >= 1 && rawName.length <= 15) {
+        const setsFromChinese = seg.match(/([两三四五六七八九十])组/);
+        const chineseNum = {'两':2,'三':3,'四':4,'五':5,'六':6,'七':7,'八':8,'九':9,'十':10};
+        const sets = setsFromChinese ? (chineseNum[setsFromChinese[1]] || 3) : 3;
+        exercises.push({ name: rawName, weight: 0, reps: parseInt(p2[3]), sets, tempo: p2[2] + '秒', notes: seg });
+        return;
+      }
+    }
+    
+    // Pattern 3: Simple "动作 重量 次数 组"
+    const p3 = seg.match(/^(.+?)\s+(\d+(?:\.\d+)?)\s*(?:kg|公斤)?\s+(\d+)\s*(?:次|个|rep)?\s+(\d+)\s*(?:组|set)/i);
+    if (p3) {
+      const rawName = p3[1].trim();
+      if (rawName.length >= 1 && rawName.length <= 15 && !exercises.find(e => e.name === rawName)) {
+        exercises.push({ name: rawName, weight: parseFloat(p3[2]), reps: parseInt(p3[3]), sets: parseInt(p3[4]), notes: '' });
+        return;
+      }
+    }
+    
+    // Pattern 4: "动作 做了/完成 N个/次" (no weight)
+    const p4 = seg.match(/^(.+?)\s*(?:做了|完成了?)?\s*(\d+)\s*(?:个|次|rep)/);
+    if (p4 && !exercises.find(e => seg.startsWith(e.name))) {
+      const rawName = p4[1].replace(/做了|完成了|练了|今天|然后|接着|最后/g, '').trim();
+      if (rawName.length >= 2 && rawName.length <= 15) {
+        exercises.push({ name: rawName, weight: 0, reps: parseInt(p4[2]), sets: 1, notes: '' });
+      }
+    }
+  });
   
   // Decision detection
   const decisionKeywords = {
