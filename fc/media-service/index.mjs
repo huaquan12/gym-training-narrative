@@ -124,12 +124,46 @@ export async function handler(event, context) {
     return respond(200, { urls });
   }
 
+  // --- Route: POST /dp-sync — Proxy to DP (digpotency) API ---
+  if (path.includes('dp-sync')) {
+    const { token, shop_id, page, page_size, date } = body;
+    if (!token) return respond(400, { error: 'token required' });
+
+    const params = new URLSearchParams({
+      shop_id: String(shop_id || 55),
+      page: String(page || 1),
+      page_size: String(page_size || 50),
+    });
+    if (date) params.set('date', date);
+
+    try {
+      const { default: https } = await import('https');
+      const dpData = await new Promise((resolve, reject) => {
+        const url = `https://www.digpotency.com/api/train/myTrainRecord?${params.toString()}`;
+        const reqOpts = {
+          headers: { 'token': token, 'Accept': 'application/json', 'Accept-Encoding': 'identity' },
+        };
+        https.get(url, reqOpts, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            try { resolve(JSON.parse(data)); }
+            catch (e) { reject(new Error('JSON parse failed: ' + data.slice(0, 200))); }
+          });
+        }).on('error', reject);
+      });
+      return respond(200, dpData);
+    } catch (err) {
+      return respond(502, { error: 'DP API proxy failed', message: err.message });
+    }
+  }
+
   // --- Route: GET / (health check) ---
   if (method === 'GET' || path === '/' || path === '') {
     return respond(200, { 
       status: 'ok', 
       service: 'gym-media-service',
-      routes: ['/sign-upload', '/sign-download', '/batch-sign'],
+      routes: ['/sign-upload', '/sign-download', '/batch-sign', '/dp-sync'],
       debug: { path, method, hasBody: !!req.body }
     });
   }

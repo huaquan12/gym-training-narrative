@@ -195,6 +195,7 @@ html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Displ
     <!-- Coach: Dashboard -->
     <div class="page active" id="page-coach-dashboard">
       <div class="stats" id="coachStats"></div>
+      <div id="dpSyncBar" style="margin-bottom:12px"></div>
       <div class="section-title">📋 学员管理</div>
       <div id="memberList"></div>
       <div class="section-title">⚡ 最近课程</div>
@@ -316,6 +317,9 @@ const CONFIG = {
   FC_BASE: 'https://gym-med-service-wetefapcun.cn-shanghai.fcapp.run',
   OSS_BUCKET: 'pubhtml-files',
   OSS_REGION: 'oss-cn-hangzhou',
+  // DP (DIG POTENCY) SaaS integration
+  DP_TOKEN: '37969453-5635-4ed9-a153-e16d007b423b',
+  DP_SHOP_ID: 55,
 };
 
 // ============================================================
@@ -422,6 +426,21 @@ function renderCoachDashboard() {
     <div class="stat"><div class="num">${d.members.length}</div><div class="label">学员</div></div>
     <div class="stat"><div class="num">${completed}</div><div class="label">已完成课</div></div>
     <div class="stat"><div class="num">${totalStorylines}</div><div class="label">活跃主线</div></div>
+  `;
+  
+  // DP SaaS sync bar
+  const dpSessions = d.sessions.filter(s => s._source === 'dp_import');
+  const lastSync = dpSessions.length > 0 ? dpSessions.sort((a,b) => (b.scheduled_at||'').localeCompare(a.scheduled_at||''))[0].scheduled_at : null;
+  document.getElementById('dpSyncBar').innerHTML = `
+    <div class="session-card" style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px">
+      <div>
+        <div style="font-size:13px;font-weight:600">🔗 SaaS 数据源</div>
+        <div style="font-size:11px;color:var(--text2);margin-top:2px">
+          DIG POTENCY · ${dpSessions.length} 条记录${lastSync ? ' · 最近 ' + formatDate(lastSync) : ''}
+        </div>
+      </div>
+      <button class="btn btn-sm" style="background:var(--accent);color:var(--bg);border:none;padding:6px 14px;border-radius:8px;font-weight:600;cursor:pointer" onclick="syncDpRecords()">🔄 同步</button>
+    </div>
   `;
   
   // Member list
@@ -965,6 +984,165 @@ async function assembleSession() {
   await saveData();
   render();
   showToast('✅ 训练记录已拼凑完成！', 'success');
+}
+
+// ============================================================
+// DP (DIG POTENCY) SaaS SYNC
+// ============================================================
+async function syncDpRecords() {
+  if (!CONFIG.DP_TOKEN) { showToast('未配置 DP Token', 'error'); return; }
+  showToast('🔄 正在从 DIG POTENCY 同步训练记录...', 'info');
+
+  const d = STATE.data;
+  // Collect existing DP IDs to avoid duplicates
+  const existingDpIds = new Set(d.sessions.filter(s => s._source === 'dp_import').map(s => s._dp_id));
+  
+  let allTrains = [];
+  let page = 1;
+  const PAGE_SIZE = 50;
+
+  try {
+    // Paginated fetch via FC proxy
+    while (true) {
+      const resp = await fetch(`${CONFIG.FC_BASE}/dp-sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: CONFIG.DP_TOKEN,
+          shop_id: CONFIG.DP_SHOP_ID,
+          page,
+          page_size: PAGE_SIZE,
+        })
+      });
+      const json = await resp.json();
+      if (json.code !== 1) { showToast('DP API 返回错误: ' + (json.msg || json.code), 'error'); return; }
+      
+      const trains = json.data?.my_train || [];
+      allTrains.push(...trains);
+      
+      if (trains.length < PAGE_SIZE) break;
+      page++;
+      if (page > 20) break; // Safety limit
+    }
+  } catch (e) {
+    showToast('DP 同步失败: ' + e.message, 'error');
+    return;
+  }
+
+  // Process each train record
+  let newCount = 0;
+  let updatedCount = 0;
+
+  // Find or create the default member (崔哥) and coach mapping
+  const defaultMember = d.members[0];
+  if (!defaultMember) { showToast('没有学员数据', 'error'); return; }
+
+  allTrains.forEach(train => {
+    // Each train has history_menu_list with past training details
+    const historyList = train.history_menu_list || [];
+    
+    historyList.forEach(hist => {
+      const dpId = hist.course_id;
+      if (!dpId || existingDpIds.has(dpId)) return; // Skip duplicates
+      
+      const actions = hist.main_action || [];
+      if (actions.length === 0) return; // Skip empty records
+      
+      // Find or create coach
+      const coachName = train.coach_name || '未知教练';
+      let coach = d.coaches.find(c => c.name === coachName);
+      if (!coach) {
+        coach = { id: uuid(), name: coachName, certifications: [], specialties: [], created_at: now() };
+        d.coaches.push(coach);
+      }
+      
+      // Create session
+      const sessionId = uuid();
+      const session = {
+        id: sessionId,
+        member_id: defaultMember.id,
+        coach_id: coach.id,
+        scheduled_at: hist.appointment_time || hist.time,
+        status: 'completed',
+        created_at: now(),
+        _source: 'dp_import',
+        _dp_id: dpId,
+        _shop_name: train.shop_name || '',
+        _menu_plan_name: train.menu_plan_name || '',
+      };
+      d.sessions.push(session);
+      
+      // Create plan from actions
+      const exercises = actions.map((act, i) => {
+        const groups = act.group || [];
+        const weights = groups.map(g => parseFloat(g.weight) || 0);
+        const reps = groups.map(g => parseInt(g.num) || 0);
+        const avgWeight = weights.length > 0 ? weights.reduce((a,b) => a+b, 0) / weights.length : 0;
+        const avgReps = reps.length > 0 ? Math.round(reps.reduce((a,b) => a+b, 0) / reps.length) : 0;
+        
+        return {
+          order: i + 1,
+          name: act.action_name,
+          sets: groups.length,
+          reps: avgReps,
+          weight_kg: Math.round(avgWeight * 10) / 10,
+          rest_seconds: 90,
+          notes: '',
+          _action_id: act.action_id,
+          _action_url: act.action_url || '',
+        };
+      });
+      
+      d.plans.push({
+        id: uuid(),
+        session_id: sessionId,
+        agent_draft: { exercises },
+        coach_final: { exercises },
+        diff_summary: { added: [], removed: [], modified: [] },
+        created_at: now(),
+        _source: 'dp_import',
+      });
+      
+      // Auto-associate with active storylines
+      const storylines = (d.storylines || []).filter(sl => sl.status === 'active' && sl.member_id === defaultMember.id);
+      storylines.forEach(sl => {
+        const keyExercises = sl.key_exercises || [];
+        const matchedExercises = exercises.filter(ex =>
+          keyExercises.some(ke => {
+            const a = ex.name.replace(/[\s\-]/g, '');
+            const b = ke.replace(/[\s\-]/g, '');
+            return a.includes(b) || b.includes(a) ||
+              a.split('').filter(c => b.includes(c)).length >= Math.min(a.length, b.length) * 0.6;
+          })
+        );
+        if (matchedExercises.length > 0) {
+          sl.progress_data_points = sl.progress_data_points || [];
+          matchedExercises.forEach(ex => {
+            sl.progress_data_points.push({
+              session_id: sessionId,
+              date: (hist.appointment_time || hist.time || '').slice(0, 10),
+              exercise: ex.name,
+              metric_name: 'weight_kg',
+              metric_value: ex.weight_kg,
+              _source: 'dp_import',
+            });
+          });
+          sl.updated_at = now();
+        }
+      });
+      
+      existingDpIds.add(dpId);
+      newCount++;
+    });
+  });
+
+  if (newCount > 0) {
+    await saveData();
+    render();
+    showToast(`✅ 已从 DP 同步 ${newCount} 条新训练记录`, 'success');
+  } else {
+    showToast('DP 数据已是最新，无需同步', 'info');
+  }
 }
 
 // --- Create Storyline ---
